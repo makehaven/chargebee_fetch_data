@@ -1,0 +1,6 @@
+chargebee_fetch_data.settings:
+  title: 'Chargebee Fetch Data'
+  description: 'Fetch and update Chargebee plan data for users.'
+  route_name: chargebee_fetch_data.form
+  parent: system.admin_config_services
+  weight: 100

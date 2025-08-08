@@ -1,0 +1,8 @@
+name: 'Chargebee Fetch Data'
+type: module
+description: 'Fetches plan data from Chargebee and updates user fields in batch.'
+package: Custom
+core_version_requirement: ^9 || ^10
+dependencies:
+  - drupal:chargebee_portal
+  - drupal:user

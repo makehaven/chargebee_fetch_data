@@ -1,0 +1,6 @@
+{
+    "name": "makehaven/chargebee_fetch_data",
+    "type": "drupal-custom-module",
+    "description": "Fetches plan data from Chargebee and updates user fields in batch.",
+    "license": "GPL-2.0-or-later"
+}

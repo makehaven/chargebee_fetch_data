@@ -1,0 +1,7 @@
+chargebee_fetch_data.form:
+  path: '/admin/config/services/chargebee-fetch-data'
+  defaults:
+    _form: '\Drupal\chargebee_fetch_data\Form\ChargebeeFetchDataForm'
+    _title: 'Fetch Chargebee Data'
+  requirements:
+    _permission: 'administer site configuration'
