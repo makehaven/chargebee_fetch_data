@@ -10,24 +10,6 @@ use GuzzleHttp\Exception\RequestException;
 
 /**
  * Provides a form to fetch Chargebee data and update user fields in batch.
- *
- * This process will:
- *   - Use the Chargebee API (using your live API key and portal URL) to fetch
- *     the active subscription for a user (filtered by their Chargebee customer ID).
- *   - Extract the plan ID and plan amount (in cents) from the subscription data.
- *   - Update the user account field "field_user_chargebee_plan" with the plan ID.
- *   - Update the user's monthly payment amount (converted from cents) from Chargebee.
- *     If the field "field_member_payment_monthly" exists on the user entity, it is
- *     updated there; otherwise, the main profile's field "field_member_payment_monthly"
- *     is updated.
- *
- * You can test this process on a single user by entering a specific UID in the "User ID"
- * field. Otherwise, if left empty, the system processes all users with a Chargebee customer ID
- * that also have the "member" role.
- *
- * Additionally, you can specify:
- *   - A "Start UID" to process only users with UID greater than or equal to that value.
- *   - A "Delay" (in whole seconds) between processing each user.
  */
 class ChargebeeFetchDataForm extends FormBase {
 
@@ -39,7 +21,7 @@ class ChargebeeFetchDataForm extends FormBase {
   }
 
   /**
-   * Builds the form.
+   * {@inheritdoc}
    */
   public function buildForm(array $form, FormStateInterface $form_state) {
     $form['description'] = [
@@ -71,6 +53,18 @@ class ChargebeeFetchDataForm extends FormBase {
       '#default_value' => 0,
       '#min' => 0,
     ];
+    $form['create_revision'] = [
+      '#type' => 'checkbox',
+      '#title' => $this->t('Create a new revision for each update'),
+      '#description' => $this->t('If checked, a new revision of the user or profile will be created with each change.'),
+      '#default_value' => FALSE,
+    ];
+    $form['detailed_logging'] = [
+      '#type' => 'checkbox',
+      '#title' => $this->t('Enable detailed logging'),
+      '#description' => $this->t('If checked, a log entry will be created for every user that is successfully updated.'),
+      '#default_value' => FALSE,
+    ];
     $form['submit'] = [
       '#type' => 'submit',
       '#value' => $this->t('Fetch and Update Data'),
@@ -79,17 +73,15 @@ class ChargebeeFetchDataForm extends FormBase {
   }
 
   /**
-   * Form submission handler: sets up and processes the batch.
+   * {@inheritdoc}
    */
   public function submitForm(array &$form, FormStateInterface $form_state) {
-    // If a UID is provided, process that one user.
     $uid_input = trim($form_state->getValue('uid'));
     if (!empty($uid_input)) {
       $user_ids = [$uid_input];
       \Drupal::messenger()->addStatus($this->t('Processing only user with UID: @uid', ['@uid' => $uid_input]));
     }
     else {
-      // Build a query for users with a Chargebee customer ID and the "member" role.
       $query = \Drupal::entityQuery('user')
         ->accessCheck(FALSE)
         ->condition('field_user_chargebee_id', NULL, 'IS NOT NULL')
@@ -104,6 +96,8 @@ class ChargebeeFetchDataForm extends FormBase {
     }
     $total_users = count($user_ids);
     $delay = (int) $form_state->getValue('delay');
+    $detailed_logging = $form_state->getValue('detailed_logging');
+    $create_revision = $form_state->getValue('create_revision');
 
     $batch_builder = new BatchBuilder();
     $batch_builder
@@ -112,123 +106,93 @@ class ChargebeeFetchDataForm extends FormBase {
       ->setProgressMessage($this->t('Processed @current out of @total users.'))
       ->setErrorMessage($this->t('An error occurred during the process.'));
 
-    // Process in chunks of 50.
     $chunks = array_chunk($user_ids, 50);
     foreach ($chunks as $chunk) {
-      $batch_builder->addOperation([static::class, 'processUserBatch'], [$chunk, $total_users, $delay]);
+      $batch_builder->addOperation([static::class, 'processUserBatch'], [$chunk, $total_users, $delay, $detailed_logging, $create_revision]);
     }
 
-    // Set the finish callback.
     $batch_builder->setFinishCallback([static::class, 'batchFinished']);
-
-    // Register the batch.
     batch_set($batch_builder->toArray());
-
-    // Instead of redirecting to /batch, call batch_process() directly.
     $response = batch_process();
     $form_state->setResponse($response);
   }
 
   /**
    * Batch operation callback.
-   *
-   * Processes each user:
-   *   - Retrieves the Chargebee customer ID.
-   *   - Calls the Chargebee API to fetch the active subscription.
-   *   - Extracts the plan ID and plan amount (in cents), converts the amount,
-   *     and updates the user's fields.
-   *
-   * @param array $user_ids
-   *   Array of user IDs to process.
-   * @param int $total_users
-   *   Total number of users being processed.
-   * @param int $delay
-   *   Delay in seconds between processing each user.
-   * @param array &$context
-   *   The batch context array.
    */
-  public static function processUserBatch(array $user_ids, $total_users, $delay, array &$context) {
+  public static function processUserBatch(array $user_ids, $total_users, $delay, $detailed_logging, $create_revision, array &$context) {
     if (!isset($context['sandbox']['processed'])) {
       $context['sandbox']['processed'] = 0;
     }
-    // Load API settings.
+
     $config = \Drupal::config('chargebee_portal.settings');
     $api_key = $config->get('live_api_key');
     $portal_url = rtrim($config->get('live_portal_url'), '/');
-    // Normalize the portal URL to use only scheme and host.
     $parsed = parse_url($portal_url);
-    if (isset($parsed['host']) && isset($parsed['scheme'])) {
-      $base_url = $parsed['scheme'] . '://' . $parsed['host'];
-    }
-    else {
-      $base_url = $portal_url;
-    }
+    $base_url = (isset($parsed['host']) && isset($parsed['scheme'])) ? $parsed['scheme'] . '://' . $parsed['host'] : $portal_url;
     $subscriptions_endpoint = $base_url . '/api/v2/subscriptions';
-
-    // Use detailed messages when processing a single user.
     $detailed = (count($user_ids) == 1);
 
     foreach ($user_ids as $uid) {
       try {
         $user = \Drupal\user\Entity\User::load($uid);
-        if (!$user) {
-          continue;
-        }
+        if (!$user) continue;
+
         if ($detailed) {
           \Drupal::messenger()->addStatus(t('Processing user @uid.', ['@uid' => $uid]));
         }
-        // Retrieve Chargebee customer ID.
+
         if ($user->hasField('field_user_chargebee_id') && !$user->get('field_user_chargebee_id')->isEmpty()) {
           $chargebee_customer_id = $user->get('field_user_chargebee_id')->value;
           if ($detailed) {
             \Drupal::messenger()->addStatus(t('Chargebee customer ID for user @uid: @cid', ['@uid' => $uid, '@cid' => $chargebee_customer_id]));
           }
-        }
-        else {
+        } else {
           \Drupal::messenger()->addWarning(t('User @uid does not have a Chargebee customer ID.', ['@uid' => $uid]));
           continue;
         }
-        // Fetch subscription data.
+
         $subscription_data = self::fetchSubscriptionForCustomer($chargebee_customer_id, $api_key, $subscriptions_endpoint);
         if ($subscription_data && isset($subscription_data['subscription'])) {
           $plan_id = $subscription_data['subscription']['plan_id'] ?? NULL;
           $plan_amount_cents = $subscription_data['subscription']['plan_amount'] ?? NULL;
+
           if ($detailed) {
-            \Drupal::messenger()->addStatus(t('Fetched subscription for customer @cid: plan_id=@pid, plan_amount_cents=@amt', [
-              '@cid' => $chargebee_customer_id,
-              '@pid' => $plan_id,
-              '@amt' => $plan_amount_cents,
-            ]));
+            \Drupal::messenger()->addStatus(t('Fetched subscription for customer @cid: plan_id=@pid, plan_amount_cents=@amt', ['@cid' => $chargebee_customer_id, '@pid' => $plan_id, '@amt' => $plan_amount_cents]));
           }
+
           if ($plan_id && $plan_amount_cents !== NULL) {
             $plan_amount = $plan_amount_cents / 100;
-            // Update the plan ID on the user.
+
             if ($user->hasField('field_user_chargebee_plan')) {
               $user->set('field_user_chargebee_plan', $plan_id);
               try {
+                if ($create_revision) {
+                  $user->setNewRevision(TRUE);
+                  $user->setRevisionLogMessage('Updated Chargebee plan ID via batch process.');
+                }
                 $user->save();
                 if ($detailed) {
                   \Drupal::messenger()->addStatus(t('User @uid saved successfully with plan ID updated.', ['@uid' => $uid]));
                 }
-                // Log the saved plan ID.
-                $updated_user = \Drupal\user\Entity\User::load($uid);
-                \Drupal::logger('chargebee_fetch_data')->notice('After saving, user @uid field_user_chargebee_plan is: @value', [
-                  '@uid' => $uid,
-                  '@value' => $updated_user->get('field_user_chargebee_plan')->value,
-                ]);
-              }
-              catch (\Exception $e) {
+                if ($detailed_logging) {
+                  \Drupal::logger('chargebee_fetch_data')->notice('User @uid updated with plan ID: @value', ['@uid' => $uid, '@value' => $user->get('field_user_chargebee_plan')->value]);
+                }
+              } catch (\Exception $e) {
                 \Drupal::messenger()->addError(t('Failed to save user @uid for plan ID: @error', ['@uid' => $uid, '@error' => $e->getMessage()]));
                 continue;
               }
-            }
-            else {
+            } else {
               \Drupal::messenger()->addWarning(t('User @uid does not have field_user_chargebee_plan.', ['@uid' => $uid]));
             }
-            // Update the monthly payment field.
+
             if ($user->hasField('field_member_payment_monthly')) {
               $user->set('field_member_payment_monthly', $plan_amount);
               try {
+                if ($create_revision) {
+                  $user->setNewRevision(TRUE);
+                  $user->setRevisionLogMessage('Updated monthly payment amount via Chargebee batch process.');
+                }
                 $user->save();
                 if ($detailed) {
                   \Drupal::messenger()->addStatus(t('User @uid saved with monthly payment @amount on account.', ['@uid' => $uid, '@amount' => $plan_amount]));
@@ -239,7 +203,6 @@ class ChargebeeFetchDataForm extends FormBase {
               }
             }
             else {
-              // Update on profile if not on user.
               $profile_storage = \Drupal::entityTypeManager()->getStorage('profile');
               $profiles = $profile_storage->loadByProperties(['uid' => $user->id(), 'type' => 'main']);
               if (!empty($profiles)) {
@@ -247,6 +210,10 @@ class ChargebeeFetchDataForm extends FormBase {
                 if ($profile->hasField('field_member_payment_monthly')) {
                   $profile->set('field_member_payment_monthly', $plan_amount);
                   try {
+                    if ($create_revision) {
+                      $profile->setNewRevision(TRUE);
+                      $profile->setRevisionLogMessage('Updated monthly payment amount via Chargebee batch process.');
+                    }
                     $profile->save();
                     if ($detailed) {
                       \Drupal::messenger()->addStatus(t('Profile for user @uid saved with monthly payment @amount.', ['@uid' => $user->id(), '@amount' => $plan_amount]));
@@ -264,24 +231,18 @@ class ChargebeeFetchDataForm extends FormBase {
                 \Drupal::messenger()->addWarning(t('No main profile found for user @uid.', ['@uid' => $user->id()]));
               }
             }
-          }
-          else {
+          } else {
             \Drupal::messenger()->addWarning(t('Subscription data incomplete for customer @cid.', ['@cid' => $chargebee_customer_id]));
           }
-        }
-        else {
+        } else {
           \Drupal::messenger()->addWarning(t('No active subscription found for customer @cid.', ['@cid' => $chargebee_customer_id]));
         }
-        // If a delay is specified, pause between users.
+
         if ($delay > 0) {
           sleep($delay);
         }
-      }
-      catch (\Exception $ex) {
-        \Drupal::messenger()->addError(t('An unexpected error occurred for user @uid: @error', [
-          '@uid' => $uid,
-          '@error' => $ex->getMessage(),
-        ]));
+      } catch (\Exception $ex) {
+        \Drupal::messenger()->addError(t('An unexpected error occurred for user @uid: @error', ['@uid' => $uid, '@error' => $ex->getMessage()]));
       }
       $context['sandbox']['processed']++;
     }
@@ -290,18 +251,6 @@ class ChargebeeFetchDataForm extends FormBase {
 
   /**
    * Helper function to fetch the active subscription for a given Chargebee customer.
-   *
-   * Implements a simple retry mechanism if the API returns a 429 error.
-   *
-   * @param string $customer_id
-   *   The Chargebee customer ID.
-   * @param string $api_key
-   *   The Chargebee API key.
-   * @param string $subscriptions_endpoint
-   *   The full URL for the subscriptions endpoint.
-   *
-   * @return array|false
-   *   The subscription data as an associative array, or FALSE on failure.
    */
   protected static function fetchSubscriptionForCustomer($customer_id, $api_key, $subscriptions_endpoint) {
     $client = \Drupal::httpClient();
@@ -346,13 +295,6 @@ class ChargebeeFetchDataForm extends FormBase {
 
   /**
    * Batch finished callback.
-   *
-   * @param bool $success
-   *   TRUE if the batch finished successfully.
-   * @param array $results
-   *   The results of each operation.
-   * @param array $operations
-   *   The operations performed.
    */
   public static function batchFinished($success, array $results, array $operations) {
     if ($success) {
