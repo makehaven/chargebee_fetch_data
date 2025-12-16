@@ -50,3 +50,27 @@ To use this module, follow these steps:
     * Enable detailed logging for troubleshooting.
 
 Click the "Fetch and Update Data" button to start the process. The module will provide status messages indicating the number of users found and the progress of the batch operation.
+
+---
+
+## Billing Plan Vocabulary Integration
+
+Each time the batch runs it now also synchronizes the `billing_plan` vocabulary:
+
+- If a taxonomy term for the Chargebee plan does not exist it will be created automatically with the plan ID as its machine value.
+- The plan term stores the monthly amount, currency, and which billing system owns the plan (`chargebee`, `stripe`, etc.).
+- When the term already has an associated membership type selected in `field_membership_type`, the sync assigns that membership to the member's profile automatically.
+
+Edit the plan term to connect it to the appropriate membership type once per plan; future syncs keep the taxonomy information current.
+
+---
+
+## Running from Drush / Cron
+
+You can trigger the same synchronization without the UI via the new Drush command:
+
+```bash
+drush chargebee:sync-plans --start-uid=1000 --delay=1
+```
+
+Options mirror the form inputs (`--uid`, `--start-uid`, `--delay`, `--create-revision`, `--detailed`). This enables cron-based refreshes or manual CLI invocations whenever you want to reconcile Chargebee with Drupal.

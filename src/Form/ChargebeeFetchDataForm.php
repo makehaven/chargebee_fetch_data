@@ -84,8 +84,7 @@ class ChargebeeFetchDataForm extends FormBase {
     else {
       $query = \Drupal::entityQuery('user')
         ->accessCheck(FALSE)
-        ->condition('field_user_chargebee_id', NULL, 'IS NOT NULL')
-        ->condition('roles', 'member');
+        ->condition('field_user_chargebee_id', NULL, 'IS NOT NULL');
       $start_uid = trim($form_state->getValue('start_uid'));
       if (!empty($start_uid)) {
         $query->condition('uid', $start_uid, '>=');
@@ -132,6 +131,14 @@ class ChargebeeFetchDataForm extends FormBase {
     $base_url = (isset($parsed['host']) && isset($parsed['scheme'])) ? $parsed['scheme'] . '://' . $parsed['host'] : $portal_url;
     $subscriptions_endpoint = $base_url . '/api/v2/subscriptions';
     $detailed = (count($user_ids) == 1);
+    
+    if (!\Drupal::hasService('chargebee_status_sync.plan_manager')) {
+      \Drupal::messenger()->addError(t('Service "chargebee_status_sync.plan_manager" not found. Please clear the cache and ensure the Chargebee Status Sync module is enabled.'));
+      $context['finished'] = 1;
+      return;
+    }
+    /** @var \Drupal\chargebee_status_sync\Service\PlanManager $plan_manager */
+    $plan_manager = \Drupal::service('chargebee_status_sync.plan_manager');
 
     foreach ($user_ids as $uid) {
       try {
@@ -154,88 +161,172 @@ class ChargebeeFetchDataForm extends FormBase {
 
         $subscription_data = self::fetchSubscriptionForCustomer($chargebee_customer_id, $api_key, $subscriptions_endpoint);
         if ($subscription_data && isset($subscription_data['subscription'])) {
-          $plan_id = $subscription_data['subscription']['plan_id'] ?? NULL;
-          $plan_amount_cents = $subscription_data['subscription']['plan_amount'] ?? NULL;
+          $sub = $subscription_data['subscription'];
+          $status = $sub['status'] ?? 'unknown';
+          $plan_id = $sub['plan_id'] ?? NULL;
+          $plan_amount_cents = $sub['plan_amount'] ?? NULL;
+          $currency = $sub['currency_code'] ?? NULL;
+          $cancelled_at = $sub['cancelled_at'] ?? NULL;
+          $plan_term = NULL;
 
           if ($detailed) {
-            \Drupal::messenger()->addStatus(t('Fetched subscription for customer @cid: plan_id=@pid, plan_amount_cents=@amt', ['@cid' => $chargebee_customer_id, '@pid' => $plan_id, '@amt' => $plan_amount_cents]));
+            \Drupal::messenger()->addStatus(t('Fetched subscription for customer @cid: status=@status, plan_id=@pid, cancelled_at=@cat', ['@cid' => $chargebee_customer_id, '@status' => $status, '@pid' => $plan_id, '@cat' => $cancelled_at]));
           }
 
+          // Initialize save tracking
+          $user_save_needed = FALSE;
+          $user_updates_log = [];
+          $profile_save_needed = FALSE;
+          $profile_updates_log = [];
+
+          // Load Main Profile
+          $profile_storage = \Drupal::entityTypeManager()->getStorage('profile');
+          $profiles = $profile_storage->loadByProperties(['uid' => $user->id(), 'type' => 'main']);
+          $profile = reset($profiles) ?: NULL;
+
+          $is_active_status = ($status == 'active' || $status == 'in_trial' || $status == 'future' || $status == 'non_renewing');
+          $is_cancelled_status = ($status == 'cancelled');
+
+          // COMMON LOGIC: Update Plan and Amount for both Active and Cancelled users
           if ($plan_id && $plan_amount_cents !== NULL) {
             $plan_amount = $plan_amount_cents / 100;
 
+            // Ensure plan term exists
+            $plan_term = $plan_manager->upsertPlan($plan_id, [
+              'amount' => $plan_amount,
+              'currency' => $currency,
+              'provider' => 'chargebee',
+            ]);
+
+            // Sync Plan ID on User
             if ($user->hasField('field_user_chargebee_plan')) {
-              $user->set('field_user_chargebee_plan', $plan_id);
-              try {
-                if ($create_revision) {
-                  $user->setNewRevision(TRUE);
-                  $user->setRevisionLogMessage('Updated Chargebee plan ID via batch process.');
-                }
-                $user->save();
-                if ($detailed) {
-                  \Drupal::messenger()->addStatus(t('User @uid saved successfully with plan ID updated.', ['@uid' => $uid]));
-                }
-                if ($detailed_logging) {
-                  \Drupal::logger('chargebee_fetch_data')->notice('User @uid updated with plan ID: @value', ['@uid' => $uid, '@value' => $user->get('field_user_chargebee_plan')->value]);
-                }
-              } catch (\Exception $e) {
-                \Drupal::messenger()->addError(t('Failed to save user @uid for plan ID: @error', ['@uid' => $uid, '@error' => $e->getMessage()]));
-                continue;
+              if ($user->get('field_user_chargebee_plan')->value !== $plan_id) {
+                $user->set('field_user_chargebee_plan', $plan_id);
+                $user_save_needed = TRUE;
+                $user_updates_log[] = 'plan ID';
               }
             } else {
               \Drupal::messenger()->addWarning(t('User @uid does not have field_user_chargebee_plan.', ['@uid' => $uid]));
             }
 
+            // Sync Monthly Payment Amount
             if ($user->hasField('field_member_payment_monthly')) {
-              $user->set('field_member_payment_monthly', $plan_amount);
-              try {
-                if ($create_revision) {
-                  $user->setNewRevision(TRUE);
-                  $user->setRevisionLogMessage('Updated monthly payment amount via Chargebee batch process.');
-                }
-                $user->save();
-                if ($detailed) {
-                  \Drupal::messenger()->addStatus(t('User @uid saved with monthly payment @amount on account.', ['@uid' => $uid, '@amount' => $plan_amount]));
-                }
-              }
-              catch (\Exception $e) {
-                \Drupal::messenger()->addError(t('Failed to save user @uid for monthly payment: @error', ['@uid' => $uid, '@error' => $e->getMessage()]));
+              if ((float) $user->get('field_member_payment_monthly')->value !== (float) $plan_amount) {
+                $user->set('field_member_payment_monthly', $plan_amount);
+                $user_save_needed = TRUE;
+                $user_updates_log[] = 'monthly payment';
               }
             }
-            else {
-              $profile_storage = \Drupal::entityTypeManager()->getStorage('profile');
-              $profiles = $profile_storage->loadByProperties(['uid' => $user->id(), 'type' => 'main']);
-              if (!empty($profiles)) {
-                $profile = reset($profiles);
-                if ($profile->hasField('field_member_payment_monthly')) {
-                  $profile->set('field_member_payment_monthly', $plan_amount);
-                  try {
-                    if ($create_revision) {
-                      $profile->setNewRevision(TRUE);
-                      $profile->setRevisionLogMessage('Updated monthly payment amount via Chargebee batch process.');
-                    }
-                    $profile->save();
-                    if ($detailed) {
-                      \Drupal::messenger()->addStatus(t('Profile for user @uid saved with monthly payment @amount.', ['@uid' => $user->id(), '@amount' => $plan_amount]));
-                    }
-                  }
-                  catch (\Exception $e) {
-                    \Drupal::messenger()->addError(t('Failed to save profile for user @uid: @error', ['@uid' => $user->id(), '@error' => $e->getMessage()]));
-                  }
-                }
-                else {
-                  \Drupal::messenger()->addWarning(t('User @uid profile does not have field_member_payment_monthly.', ['@uid' => $user->id()]));
-                }
-              }
-              else {
-                \Drupal::messenger()->addWarning(t('No main profile found for user @uid.', ['@uid' => $user->id()]));
+            elseif ($profile && $profile->hasField('field_member_payment_monthly')) {
+              if ((float) $profile->get('field_member_payment_monthly')->value !== (float) $plan_amount) {
+                $profile->set('field_member_payment_monthly', $plan_amount);
+                $profile_save_needed = TRUE;
+                $profile_updates_log[] = 'monthly payment';
               }
             }
-          } else {
-            \Drupal::messenger()->addWarning(t('Subscription data incomplete for customer @cid.', ['@cid' => $chargebee_customer_id]));
+
+            // Sync Membership Type from Plan to Profile (Inline to avoid extra saves)
+            if ($plan_term && $profile && $plan_term->hasField('field_membership_type') && !$plan_term->get('field_membership_type')->isEmpty()) {
+               $target_type_id = $plan_term->get('field_membership_type')->target_id;
+               if ($profile->hasField('field_membership_type')) {
+                   if ($profile->get('field_membership_type')->target_id != $target_type_id) {
+                       $profile->set('field_membership_type', $target_type_id);
+                       $profile_save_needed = TRUE;
+                       $profile_updates_log[] = 'membership type';
+                   }
+               }
+            }
           }
+
+          // STATUS SPECIFIC LOGIC
+          if ($is_active_status) {
+            // Active users: Clear end date on PROFILE
+            if ($profile && $profile->hasField('field_member_end_date') && !$profile->get('field_member_end_date')->isEmpty()) {
+              $profile->set('field_member_end_date', NULL);
+              $profile_save_needed = TRUE;
+              $profile_updates_log[] = 'cleared end date';
+            }
+          } 
+          elseif ($is_cancelled_status && $cancelled_at) {
+            // Cancelled users: Set end date on PROFILE
+            if ($profile && $profile->hasField('field_member_end_date')) {
+              // Format for DateTime field (Y-m-d) in UTC - Field is configured as Date Only
+              $formatted_date = gmdate('Y-m-d', $cancelled_at);
+              
+              $current_val = $profile->get('field_member_end_date')->value;
+              // Simple string comparison for DateTime
+              if ($current_val !== $formatted_date) {
+                $profile->set('field_member_end_date', $formatted_date);
+                $profile_save_needed = TRUE;
+                $profile_updates_log[] = 'end date set to ' . $formatted_date;
+              }
+            } elseif ($detailed && !$profile) {
+               \Drupal::messenger()->addWarning(t('User @uid is cancelled but no main profile found to set end date.', ['@uid' => $uid]));
+            }
+          }
+
+          // SAVE PROFILE
+          if ($profile_save_needed && $profile) {
+            try {
+              if ($create_revision) {
+                $profile->setNewRevision(TRUE);
+                $profile->setRevisionLogMessage('Updated Chargebee data via batch process: ' . implode(', ', $profile_updates_log));
+              }
+              $profile->save();
+              if ($detailed) {
+                \Drupal::messenger()->addStatus(t('Profile for user @uid saved successfully. Updated: @updates', ['@uid' => $uid, '@updates' => implode(', ', $profile_updates_log)]));
+              }
+              if ($detailed_logging) {
+                \Drupal::logger('chargebee_fetch_data')->notice('Profile for user @uid updated. Fields: @fields', ['@uid' => $uid, '@fields' => implode(', ', $profile_updates_log)]);
+              }
+            } catch (\Exception $e) {
+              \Drupal::messenger()->addError(t('Failed to save profile for user @uid: @error (Class: @class)', [
+                '@uid' => $uid,
+                '@error' => $e->getMessage(),
+                '@class' => get_class($e),
+              ]));
+              \Drupal::logger('chargebee_fetch_data')->error('Failed to save profile for user @uid: @error. Trace: @trace', [
+                  '@uid' => $uid,
+                  '@error' => $e->getMessage(),
+                  '@trace' => $e->getTraceAsString(),
+              ]);
+            }
+          } elseif ($detailed && !$profile_save_needed && $profile) {
+             \Drupal::messenger()->addStatus(t('Profile for user @uid already up to date.', ['@uid' => $uid]));
+          }
+
+          // SAVE USER
+          if ($user_save_needed) {
+            try {
+              if ($create_revision) {
+                $user->setNewRevision(TRUE);
+                $user->setRevisionLogMessage('Updated Chargebee data via batch process: ' . implode(', ', $user_updates_log));
+              }
+              $user->save();
+              if ($detailed) {
+                \Drupal::messenger()->addStatus(t('User @uid saved successfully. Updated: @updates', ['@uid' => $uid, '@updates' => implode(', ', $user_updates_log)]));
+              }
+              if ($detailed_logging) {
+                \Drupal::logger('chargebee_fetch_data')->notice('User @uid updated. Fields: @fields', ['@uid' => $uid, '@fields' => implode(', ', $user_updates_log)]);
+              }
+            } catch (\Exception $e) {
+              \Drupal::messenger()->addError(t('Failed to save user @uid: @error (Class: @class)', [
+                '@uid' => $uid,
+                '@error' => $e->getMessage(),
+                '@class' => get_class($e),
+              ]));
+               \Drupal::logger('chargebee_fetch_data')->error('Failed to save user @uid: @error. Trace: @trace', [
+                  '@uid' => $uid,
+                  '@error' => $e->getMessage(),
+                  '@trace' => $e->getTraceAsString(),
+              ]);
+            }
+          } elseif ($detailed && !$user_save_needed) {
+            \Drupal::messenger()->addStatus(t('User @uid already up to date.', ['@uid' => $uid]));
+          }
+
         } else {
-          \Drupal::messenger()->addWarning(t('No active subscription found for customer @cid.', ['@cid' => $chargebee_customer_id]));
+          \Drupal::messenger()->addWarning(t('No subscription found for customer @cid.', ['@cid' => $chargebee_customer_id]));
         }
 
         if ($delay > 0) {
@@ -263,7 +354,7 @@ class ChargebeeFetchDataForm extends FormBase {
           'query' => [
             'customer_id[is]' => $customer_id,
             'limit' => 1,
-            'status[is]' => 'active',
+            'sort_by[desc]' => 'updated_at',
           ],
         ]);
         $data = json_decode($response->getBody()->getContents(), TRUE);
@@ -271,7 +362,7 @@ class ChargebeeFetchDataForm extends FormBase {
           return $data['list'][0];
         }
         else {
-          \Drupal::messenger()->addWarning(t('No subscription data returned for customer @cid.', ['@cid' => $customer_id]));
+          // No subscription found
           return FALSE;
         }
       }
