@@ -246,6 +246,14 @@ class ChargebeeFetchDataForm extends FormBase {
               $profile_save_needed = TRUE;
               $profile_updates_log[] = 'cleared end date';
             }
+
+            // Active users: Ensure Member Role
+            $member_role_id = \Drupal::config('chargebee_status_sync.settings')->get('chargebee_status_member_role');
+            if ($member_role_id && !$user->hasRole($member_role_id)) {
+                $user->addRole($member_role_id);
+                $user_save_needed = TRUE;
+                $user_updates_log[] = 'added member role';
+            }
           } 
           elseif ($is_cancelled_status && $cancelled_at) {
             // Cancelled users: Set end date on PROFILE
