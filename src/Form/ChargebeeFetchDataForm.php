@@ -271,6 +271,14 @@ class ChargebeeFetchDataForm extends FormBase {
             } elseif ($detailed && !$profile) {
                \Drupal::messenger()->addWarning(t('User @uid is cancelled but no main profile found to set end date.', ['@uid' => $uid]));
             }
+
+            // Cancelled users: Ensure Member Role is REMOVED
+            $member_role_id = \Drupal::config('chargebee_status_sync.settings')->get('chargebee_status_member_role');
+            if ($member_role_id && $user->hasRole($member_role_id)) {
+                $user->removeRole($member_role_id);
+                $user_save_needed = TRUE;
+                $user_updates_log[] = 'removed member role';
+            }
           }
 
           // SAVE PROFILE
