@@ -210,14 +210,7 @@ class ChargebeeFetchDataForm extends FormBase {
             }
 
             // Sync Monthly Payment Amount
-            if ($user->hasField('field_member_payment_monthly')) {
-              if ((float) $user->get('field_member_payment_monthly')->value !== (float) $plan_amount) {
-                $user->set('field_member_payment_monthly', $plan_amount);
-                $user_save_needed = TRUE;
-                $user_updates_log[] = 'monthly payment';
-              }
-            }
-            elseif ($profile && $profile->hasField('field_member_payment_monthly')) {
+            if ($profile && $profile->hasField('field_member_payment_monthly')) {
               if ((float) $profile->get('field_member_payment_monthly')->value !== (float) $plan_amount) {
                 $profile->set('field_member_payment_monthly', $plan_amount);
                 $profile_save_needed = TRUE;
@@ -296,14 +289,17 @@ class ChargebeeFetchDataForm extends FormBase {
                 \Drupal::logger('chargebee_fetch_data')->notice('Profile for user @uid updated. Fields: @fields', ['@uid' => $uid, '@fields' => implode(', ', $profile_updates_log)]);
               }
             } catch (\Exception $e) {
-              \Drupal::messenger()->addError(t('Failed to save profile for user @uid: @error (Class: @class)', [
+              $previous_msg = $e->getPrevious() ? $e->getPrevious()->getMessage() : 'None';
+              \Drupal::messenger()->addError(t('Failed to save profile for user @uid: @error (Prev: @prev) (Class: @class)', [
                 '@uid' => $uid,
                 '@error' => $e->getMessage(),
+                '@prev' => $previous_msg,
                 '@class' => get_class($e),
               ]));
-              \Drupal::logger('chargebee_fetch_data')->error('Failed to save profile for user @uid: @error. Trace: @trace', [
+              \Drupal::logger('chargebee_fetch_data')->error('Failed to save profile for user @uid: @error. Prev: @prev. Trace: @trace', [
                   '@uid' => $uid,
                   '@error' => $e->getMessage(),
+                  '@prev' => $previous_msg,
                   '@trace' => $e->getTraceAsString(),
               ]);
             }
@@ -326,14 +322,17 @@ class ChargebeeFetchDataForm extends FormBase {
                 \Drupal::logger('chargebee_fetch_data')->notice('User @uid updated. Fields: @fields', ['@uid' => $uid, '@fields' => implode(', ', $user_updates_log)]);
               }
             } catch (\Exception $e) {
-              \Drupal::messenger()->addError(t('Failed to save user @uid: @error (Class: @class)', [
+              $previous_msg = $e->getPrevious() ? $e->getPrevious()->getMessage() : 'None';
+              \Drupal::messenger()->addError(t('Failed to save user @uid: @error (Prev: @prev) (Class: @class)', [
                 '@uid' => $uid,
                 '@error' => $e->getMessage(),
+                '@prev' => $previous_msg,
                 '@class' => get_class($e),
               ]));
-               \Drupal::logger('chargebee_fetch_data')->error('Failed to save user @uid: @error. Trace: @trace', [
+               \Drupal::logger('chargebee_fetch_data')->error('Failed to save user @uid: @error. Prev: @prev. Trace: @trace', [
                   '@uid' => $uid,
                   '@error' => $e->getMessage(),
+                  '@prev' => $previous_msg,
                   '@trace' => $e->getTraceAsString(),
               ]);
             }
@@ -362,7 +361,6 @@ class ChargebeeFetchDataForm extends FormBase {
   protected static function fetchSubscriptionForCustomer($customer_id, $api_key, $subscriptions_endpoint) {
     $client = \Drupal::httpClient();
     $maxRetries = 3;
-    $retryDelay = 2;
     for ($attempt = 0; $attempt < $maxRetries; $attempt++) {
       try {
         $response = $client->get($subscriptions_endpoint, [
@@ -384,6 +382,7 @@ class ChargebeeFetchDataForm extends FormBase {
       }
       catch (RequestException $e) {
         if ($e->hasResponse() && $e->getResponse()->getStatusCode() == 429) {
+          $retryDelay = 2 * pow(2, $attempt);
           \Drupal::messenger()->addWarning(t('Rate limit reached for customer @cid, retrying in @delay seconds...', ['@cid' => $customer_id, '@delay' => $retryDelay]));
           sleep($retryDelay);
           continue;
