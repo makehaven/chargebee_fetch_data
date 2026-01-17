@@ -91,7 +91,7 @@ class ChargebeeFetchDataForm extends FormBase {
         \Drupal::messenger()->addStatus($this->t('Processing only users with UID ≥ @uid', ['@uid' => $start_uid]));
       }
       $user_ids = $query->execute();
-      \Drupal::messenger()->addStatus($this->t('Found @count users with a Chargebee customer ID and the member role.', ['@count' => count($user_ids)]));
+      \Drupal::messenger()->addStatus($this->t('Found @count users with a Chargebee customer ID.', ['@count' => count($user_ids)]));
     }
     $total_users = count($user_ids);
     $delay = (int) $form_state->getValue('delay');
@@ -140,10 +140,30 @@ class ChargebeeFetchDataForm extends FormBase {
     /** @var \Drupal\chargebee_status_sync\Service\PlanManager $plan_manager */
     $plan_manager = \Drupal::service('chargebee_status_sync.plan_manager');
 
+    // Pre-load users and collect Chargebee Customer IDs.
+    $users_to_process = [];
+    $customer_ids = [];
+    foreach ($user_ids as $uid) {
+      $user = \Drupal\user\Entity\User::load($uid);
+      if (!$user) continue;
+      $users_to_process[$uid] = $user;
+      if ($user->hasField('field_user_chargebee_id') && !$user->get('field_user_chargebee_id')->isEmpty()) {
+        $customer_ids[] = $user->get('field_user_chargebee_id')->value;
+      }
+    }
+
+    if (empty($customer_ids)) {
+      $context['sandbox']['processed'] += count($user_ids);
+      return;
+    }
+
+    // Fetch subscriptions in one batch call for all customers in this chunk.
+    $subscriptions_map = self::fetchSubscriptionsForCustomers($customer_ids, $api_key, $subscriptions_endpoint);
+
     foreach ($user_ids as $uid) {
       try {
-        $user = \Drupal\user\Entity\User::load($uid);
-        if (!$user) continue;
+        if (!isset($users_to_process[$uid])) continue;
+        $user = $users_to_process[$uid];
 
         if ($detailed) {
           \Drupal::messenger()->addStatus(t('Processing user @uid.', ['@uid' => $uid]));
@@ -151,15 +171,14 @@ class ChargebeeFetchDataForm extends FormBase {
 
         if ($user->hasField('field_user_chargebee_id') && !$user->get('field_user_chargebee_id')->isEmpty()) {
           $chargebee_customer_id = $user->get('field_user_chargebee_id')->value;
-          if ($detailed) {
-            \Drupal::messenger()->addStatus(t('Chargebee customer ID for user @uid: @cid', ['@uid' => $uid, '@cid' => $chargebee_customer_id]));
-          }
         } else {
-          \Drupal::messenger()->addWarning(t('User @uid does not have a Chargebee customer ID.', ['@uid' => $uid]));
+          if ($detailed) {
+            \Drupal::messenger()->addWarning(t('User @uid does not have a Chargebee customer ID.', ['@uid' => $uid]));
+          }
           continue;
         }
 
-        $subscription_data = self::fetchSubscriptionForCustomer($chargebee_customer_id, $api_key, $subscriptions_endpoint);
+        $subscription_data = $subscriptions_map[$chargebee_customer_id] ?? NULL;
         if ($subscription_data && isset($subscription_data['subscription'])) {
           $sub = $subscription_data['subscription'];
           $status = $sub['status'] ?? 'unknown';
@@ -170,7 +189,7 @@ class ChargebeeFetchDataForm extends FormBase {
           $plan_term = NULL;
 
           if ($detailed) {
-            \Drupal::messenger()->addStatus(t('Fetched subscription for customer @cid: status=@status, plan_id=@pid, cancelled_at=@cat', ['@cid' => $chargebee_customer_id, '@status' => $status, '@pid' => $plan_id, '@cat' => $cancelled_at]));
+            \Drupal::messenger()->addStatus(t('Matched subscription for customer @cid: status=@status, plan_id=@pid', ['@cid' => $chargebee_customer_id, '@status' => $status, '@pid' => $plan_id]));
           }
 
           // Initialize save tracking
@@ -205,8 +224,6 @@ class ChargebeeFetchDataForm extends FormBase {
                 $user_save_needed = TRUE;
                 $user_updates_log[] = 'plan ID';
               }
-            } else {
-              \Drupal::messenger()->addWarning(t('User @uid does not have field_user_chargebee_plan.', ['@uid' => $uid]));
             }
 
             // Sync Monthly Payment Amount
@@ -218,7 +235,7 @@ class ChargebeeFetchDataForm extends FormBase {
               }
             }
 
-            // Sync Membership Type from Plan to Profile (Inline to avoid extra saves)
+            // Sync Membership Type from Plan to Profile
             if ($plan_term && $profile && $plan_term->hasField('field_membership_type') && !$plan_term->get('field_membership_type')->isEmpty()) {
                $target_type_id = $plan_term->get('field_membership_type')->target_id;
                if ($profile->hasField('field_membership_type')) {
@@ -251,18 +268,13 @@ class ChargebeeFetchDataForm extends FormBase {
           elseif ($is_cancelled_status && $cancelled_at) {
             // Cancelled users: Set end date on PROFILE
             if ($profile && $profile->hasField('field_member_end_date')) {
-              // Format for DateTime field (Y-m-d) in UTC - Field is configured as Date Only
               $formatted_date = gmdate('Y-m-d', $cancelled_at);
-              
               $current_val = $profile->get('field_member_end_date')->value;
-              // Simple string comparison for DateTime
               if ($current_val !== $formatted_date) {
                 $profile->set('field_member_end_date', $formatted_date);
                 $profile_save_needed = TRUE;
                 $profile_updates_log[] = 'end date set to ' . $formatted_date;
               }
-            } elseif ($detailed && !$profile) {
-               \Drupal::messenger()->addWarning(t('User @uid is cancelled but no main profile found to set end date.', ['@uid' => $uid]));
             }
 
             // Cancelled users: Ensure Member Role is REMOVED
@@ -276,72 +288,30 @@ class ChargebeeFetchDataForm extends FormBase {
 
           // SAVE PROFILE
           if ($profile_save_needed && $profile) {
-            try {
-              if ($create_revision) {
-                $profile->setNewRevision(TRUE);
-                $profile->setRevisionLogMessage('Updated Chargebee data via batch process: ' . implode(', ', $profile_updates_log));
-              }
-              $profile->save();
-              if ($detailed) {
-                \Drupal::messenger()->addStatus(t('Profile for user @uid saved successfully. Updated: @updates', ['@uid' => $uid, '@updates' => implode(', ', $profile_updates_log)]));
-              }
-              if ($detailed_logging) {
-                \Drupal::logger('chargebee_fetch_data')->notice('Profile for user @uid updated. Fields: @fields', ['@uid' => $uid, '@fields' => implode(', ', $profile_updates_log)]);
-              }
-            } catch (\Exception $e) {
-              $previous_msg = $e->getPrevious() ? $e->getPrevious()->getMessage() : 'None';
-              \Drupal::messenger()->addError(t('Failed to save profile for user @uid: @error (Prev: @prev) (Class: @class)', [
-                '@uid' => $uid,
-                '@error' => $e->getMessage(),
-                '@prev' => $previous_msg,
-                '@class' => get_class($e),
-              ]));
-              \Drupal::logger('chargebee_fetch_data')->error('Failed to save profile for user @uid: @error. Prev: @prev. Trace: @trace', [
-                  '@uid' => $uid,
-                  '@error' => $e->getMessage(),
-                  '@prev' => $previous_msg,
-                  '@trace' => $e->getTraceAsString(),
-              ]);
+            if ($create_revision) {
+              $profile->setNewRevision(TRUE);
+              $profile->setRevisionLogMessage('Updated Chargebee data via batch process: ' . implode(', ', $profile_updates_log));
             }
-          } elseif ($detailed && !$profile_save_needed && $profile) {
-             \Drupal::messenger()->addStatus(t('Profile for user @uid already up to date.', ['@uid' => $uid]));
+            $profile->save();
           }
 
           // SAVE USER
           if ($user_save_needed) {
-            try {
-              if ($create_revision) {
-                $user->setNewRevision(TRUE);
-                $user->setRevisionLogMessage('Updated Chargebee data via batch process: ' . implode(', ', $user_updates_log));
-              }
-              $user->save();
-              if ($detailed) {
-                \Drupal::messenger()->addStatus(t('User @uid saved successfully. Updated: @updates', ['@uid' => $uid, '@updates' => implode(', ', $user_updates_log)]));
-              }
-              if ($detailed_logging) {
-                \Drupal::logger('chargebee_fetch_data')->notice('User @uid updated. Fields: @fields', ['@uid' => $uid, '@fields' => implode(', ', $user_updates_log)]);
-              }
-            } catch (\Exception $e) {
-              $previous_msg = $e->getPrevious() ? $e->getPrevious()->getMessage() : 'None';
-              \Drupal::messenger()->addError(t('Failed to save user @uid: @error (Prev: @prev) (Class: @class)', [
-                '@uid' => $uid,
-                '@error' => $e->getMessage(),
-                '@prev' => $previous_msg,
-                '@class' => get_class($e),
-              ]));
-               \Drupal::logger('chargebee_fetch_data')->error('Failed to save user @uid: @error. Prev: @prev. Trace: @trace', [
-                  '@uid' => $uid,
-                  '@error' => $e->getMessage(),
-                  '@prev' => $previous_msg,
-                  '@trace' => $e->getTraceAsString(),
-              ]);
+            if ($create_revision) {
+              $user->setNewRevision(TRUE);
+              $user->setRevisionLogMessage('Updated Chargebee data via batch process: ' . implode(', ', $user_updates_log));
             }
-          } elseif ($detailed && !$user_save_needed) {
-            \Drupal::messenger()->addStatus(t('User @uid already up to date.', ['@uid' => $uid]));
+            $user->save();
           }
 
         } else {
-          \Drupal::messenger()->addWarning(t('No subscription found for customer @cid.', ['@cid' => $chargebee_customer_id]));
+          $user_url = $user->toUrl()->setAbsolute()->toString();
+          \Drupal::messenger()->addWarning(t('No subscription found for customer @cid (User: <a href="@url" target="_blank">@name (@uid)</a>).', [
+            '@cid' => $chargebee_customer_id,
+            '@url' => $user_url,
+            '@name' => $user->getDisplayName(),
+            '@uid' => $user->id(),
+          ]));
         }
 
         if ($delay > 0) {
@@ -356,47 +326,54 @@ class ChargebeeFetchDataForm extends FormBase {
   }
 
   /**
-   * Helper function to fetch the active subscription for a given Chargebee customer.
+   * Helper function to fetch subscriptions for a list of customers.
    */
-  protected static function fetchSubscriptionForCustomer($customer_id, $api_key, $subscriptions_endpoint) {
+  protected static function fetchSubscriptionsForCustomers(array $customer_ids, $api_key, $subscriptions_endpoint) {
     $client = \Drupal::httpClient();
-    $maxRetries = 3;
+    $maxRetries = 4;
+    
+    // Construct the [in] filter using a JSON-like array string which Chargebee supports for many filters.
+    // E.g. customer_id[in]=["id1","id2"]
+    $id_filter = '[' . implode(',', array_map(fn($id) => '"' . addslashes($id) . '"', $customer_ids)) . ']';
+
     for ($attempt = 0; $attempt < $maxRetries; $attempt++) {
       try {
         $response = $client->get($subscriptions_endpoint, [
           'auth' => [$api_key, ''],
           'query' => [
-            'customer_id[is]' => $customer_id,
-            'limit' => 1,
+            'customer_id[in]' => $id_filter,
+            'limit' => 100, // Sufficient to cover most subscription lists for 50 customers.
             'sort_by[desc]' => 'updated_at',
           ],
         ]);
+        
         $data = json_decode($response->getBody()->getContents(), TRUE);
-        if (!empty($data['list'][0]['subscription'])) {
-          return $data['list'][0];
+        $map = [];
+        if (!empty($data['list'])) {
+          foreach ($data['list'] as $item) {
+            $cid = $item['subscription']['customer_id'] ?? NULL;
+            if ($cid && !isset($map[$cid])) {
+              // The first one we encounter is the most recently updated because of sort_by[desc].
+              $map[$cid] = $item;
+            }
+          }
         }
-        else {
-          // No subscription found
-          return FALSE;
-        }
+        return $map;
       }
       catch (RequestException $e) {
         if ($e->hasResponse() && $e->getResponse()->getStatusCode() == 429) {
-          $retryDelay = 2 * pow(2, $attempt);
-          \Drupal::messenger()->addWarning(t('Rate limit reached for customer @cid, retrying in @delay seconds...', ['@cid' => $customer_id, '@delay' => $retryDelay]));
+          $retryDelay = 5 * pow(2, $attempt);
+          \Drupal::messenger()->addWarning(t('Rate limit reached during batch fetch, retrying in @delay seconds...', ['@delay' => $retryDelay]));
           sleep($retryDelay);
           continue;
         }
         else {
-          \Drupal::messenger()->addError(t('Chargebee API request failed for customer @cid: @error', [
-            '@cid' => $customer_id,
-            '@error' => $e->getMessage(),
-          ]));
-          return FALSE;
+          \Drupal::messenger()->addError(t('Chargebee API batch request failed: @error', ['@error' => $e->getMessage()]));
+          return [];
         }
       }
     }
-    return FALSE;
+    return [];
   }
 
   /**
