@@ -148,7 +148,12 @@ class ChargebeeFetchDataForm extends FormBase {
       if (!$user) continue;
       $users_to_process[$uid] = $user;
       if ($user->hasField('field_user_chargebee_id') && !$user->get('field_user_chargebee_id')->isEmpty()) {
-        $customer_ids[] = $user->get('field_user_chargebee_id')->value;
+        $val = trim($user->get('field_user_chargebee_id')->value);
+        // Clean ID: remove 'was ' prefix and anything after ' --'.
+        $val = preg_replace(['/^was\s+/i', '/\s+--.*$/'], '', $val);
+        if (!empty($val)) {
+          $customer_ids[] = $val;
+        }
       }
     }
 
@@ -170,7 +175,9 @@ class ChargebeeFetchDataForm extends FormBase {
         }
 
         if ($user->hasField('field_user_chargebee_id') && !$user->get('field_user_chargebee_id')->isEmpty()) {
-          $chargebee_customer_id = $user->get('field_user_chargebee_id')->value;
+          $chargebee_customer_id = trim($user->get('field_user_chargebee_id')->value);
+          // Clean ID: remove 'was ' prefix and anything after ' --'.
+          $chargebee_customer_id = preg_replace(['/^was\s+/i', '/\s+--.*$/'], '', $chargebee_customer_id);
         } else {
           if ($detailed) {
             \Drupal::messenger()->addWarning(t('User @uid does not have a Chargebee customer ID.', ['@uid' => $uid]));
@@ -336,44 +343,69 @@ class ChargebeeFetchDataForm extends FormBase {
     // E.g. customer_id[in]=["id1","id2"]
     $id_filter = '[' . implode(',', array_map(fn($id) => '"' . addslashes($id) . '"', $customer_ids)) . ']';
 
-    for ($attempt = 0; $attempt < $maxRetries; $attempt++) {
-      try {
-        $response = $client->get($subscriptions_endpoint, [
-          'auth' => [$api_key, ''],
-          'query' => [
+    $map = [];
+    $offset = NULL;
+
+    do {
+      $success = FALSE;
+      for ($attempt = 0; $attempt < $maxRetries; $attempt++) {
+        try {
+          $query = [
             'customer_id[in]' => $id_filter,
-            'limit' => 100, // Sufficient to cover most subscription lists for 50 customers.
+            'limit' => 100, 
             'sort_by[desc]' => 'updated_at',
-          ],
-        ]);
-        
-        $data = json_decode($response->getBody()->getContents(), TRUE);
-        $map = [];
-        if (!empty($data['list'])) {
-          foreach ($data['list'] as $item) {
-            $cid = $item['subscription']['customer_id'] ?? NULL;
-            if ($cid && !isset($map[$cid])) {
-              // The first one we encounter is the most recently updated because of sort_by[desc].
-              $map[$cid] = $item;
+          ];
+          if ($offset) {
+            $query['offset'] = $offset;
+          }
+
+          $response = $client->get($subscriptions_endpoint, [
+            'auth' => [$api_key, ''],
+            'query' => $query,
+          ]);
+          
+          $data = json_decode($response->getBody()->getContents(), TRUE);
+          
+          if (!empty($data['list'])) {
+            foreach ($data['list'] as $item) {
+              $cid = $item['subscription']['customer_id'] ?? NULL;
+              // Because we sort by updated_at desc, the first time we see a customer ID, 
+              // it's their most recent subscription state in this result set.
+              // However, since we are paginating, a newer subscription might have appeared on a previous page.
+              // So we only set it if NOT set.
+              if ($cid && !isset($map[$cid])) {
+                $map[$cid] = $item;
+              }
             }
           }
+
+          $offset = $data['next_offset'] ?? NULL;
+          $success = TRUE;
+          break; // Exit retry loop
         }
-        return $map;
+        catch (RequestException $e) {
+          if ($e->hasResponse() && $e->getResponse()->getStatusCode() == 429) {
+            $retryDelay = 5 * pow(2, $attempt);
+            \Drupal::messenger()->addWarning(t('Rate limit reached during batch fetch, retrying in @delay seconds...', ['@delay' => $retryDelay]));
+            sleep($retryDelay);
+            continue;
+          }
+          else {
+            \Drupal::messenger()->addError(t('Chargebee API batch request failed: @error', ['@error' => $e->getMessage()]));
+            // If a hard error occurs, we might want to stop or return partial data. 
+            // For now, let's break the pagination loop to avoid infinite loops on hard errors.
+            $offset = NULL; 
+            break;
+          }
+        }
       }
-      catch (RequestException $e) {
-        if ($e->hasResponse() && $e->getResponse()->getStatusCode() == 429) {
-          $retryDelay = 5 * pow(2, $attempt);
-          \Drupal::messenger()->addWarning(t('Rate limit reached during batch fetch, retrying in @delay seconds...', ['@delay' => $retryDelay]));
-          sleep($retryDelay);
-          continue;
-        }
-        else {
-          \Drupal::messenger()->addError(t('Chargebee API batch request failed: @error', ['@error' => $e->getMessage()]));
-          return [];
-        }
+      if (!$success) {
+        // If we failed all retries for a page, stop pagination to prevent infinite loops or missing data assumptions.
+        break;
       }
-    }
-    return [];
+    } while ($offset);
+
+    return $map;
   }
 
   /**
