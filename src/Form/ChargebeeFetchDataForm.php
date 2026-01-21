@@ -242,16 +242,17 @@ class ChargebeeFetchDataForm extends FormBase {
               }
             }
 
-            // Sync Membership Type from Plan to Profile
-            if ($plan_term && $profile && $plan_term->hasField('field_membership_type') && !$plan_term->get('field_membership_type')->isEmpty()) {
-               $target_type_id = $plan_term->get('field_membership_type')->target_id;
-               if ($profile->hasField('field_membership_type')) {
-                   if ($profile->get('field_membership_type')->target_id != $target_type_id) {
-                       $profile->set('field_membership_type', $target_type_id);
-                       $profile_save_needed = TRUE;
-                       $profile_updates_log[] = 'membership type';
-                   }
-               }
+            // Sync Membership Type from the billing plan term.
+            if ($profile && $profile->hasField('field_membership_type')) {
+              $target_type_id = NULL;
+              if ($plan_term && $plan_term->hasField('field_membership_type') && !$plan_term->get('field_membership_type')->isEmpty()) {
+                $target_type_id = (int) $plan_term->get('field_membership_type')->target_id;
+              }
+              if ($target_type_id && (int) $profile->get('field_membership_type')->target_id !== (int) $target_type_id) {
+                $profile->set('field_membership_type', $target_type_id);
+                $profile_save_needed = TRUE;
+                $profile_updates_log[] = 'membership type';
+              }
             }
           }
 
