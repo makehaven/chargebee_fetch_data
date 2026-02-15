@@ -30,6 +30,7 @@ class ChargebeeFetchDataForm extends FormBase {
           <li><strong>field_user_chargebee_plan</strong>: Updated with the plan ID from Chargebee.</li>
           <li><strong>field_member_payment_monthly</strong>: Updated with the monthly payment amount (converted from cents) from Chargebee.
             If this field is not present on the user account, the system will attempt to update it on the main profile.</li>
+          <li><strong>field_chargebee_followup</strong>: Updated with the followup status from Chargebee custom field (cf_Cancelation_Followup).</li>
         </ul>
         <p>You may enter a specific User ID (UID) to test the process on one user. Otherwise, all users with a Chargebee customer ID and the "member" role will be processed.</p>
         <p>You can also optionally specify a <em>Start UID</em> to process only users with UID ≥ that value, and a <em>Delay</em> (in seconds) between processing each user.</p>'),
@@ -193,6 +194,7 @@ class ChargebeeFetchDataForm extends FormBase {
           $plan_amount_cents = $sub['plan_amount'] ?? NULL;
           $currency = $sub['currency_code'] ?? NULL;
           $cancelled_at = $sub['cancelled_at'] ?? NULL;
+          $followup_status = $sub['cf_Cancelation_Followup'] ?? NULL;
           $plan_term = NULL;
 
           if ($detailed) {
@@ -303,6 +305,17 @@ class ChargebeeFetchDataForm extends FormBase {
             $profile->save();
           }
 
+          // SYNC FOLLOWUP STATUS
+          if ($followup_status && $user->hasField('field_chargebee_followup')) {
+            $followup_drupal = self::mapFollowupStatus($followup_status);
+            $current_followup = $user->get('field_chargebee_followup')->value;
+            if ($followup_drupal !== $current_followup) {
+              $user->set('field_chargebee_followup', $followup_drupal);
+              $user_save_needed = TRUE;
+              $user_updates_log[] = 'followup status';
+            }
+          }
+
           // SAVE USER
           if ($user_save_needed) {
             if ($create_revision) {
@@ -407,6 +420,26 @@ class ChargebeeFetchDataForm extends FormBase {
     } while ($offset);
 
     return $map;
+  }
+
+  /**
+   * Maps Chargebee followup status labels to Drupal machine names.
+   *
+   * @param string $chargebee_value
+   *   The value from Chargebee (e.g., "Outreach Active").
+   *
+   * @return string|null
+   *   The Drupal machine name, or NULL if not mapped.
+   */
+  protected static function mapFollowupStatus(string $chargebee_value): ?string {
+    $mapping = [
+      'Outreach Active' => 'outreach_active',
+      'Confirmed Cancellation' => 'confirmed_cancellation',
+      'Outreach Exhausted' => 'outreach_exhausted',
+      'Return Intent' => 'return_intent',
+      'Not Contacted' => NULL,
+    ];
+    return $mapping[$chargebee_value] ?? NULL;
   }
 
   /**
